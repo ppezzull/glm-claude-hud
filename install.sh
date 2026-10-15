@@ -3,7 +3,7 @@
 # Installs the wrapper and prints the statusLine block to add to ~/.claude/settings.json.
 set -euo pipefail
 
-REPO_URL="https://raw.githubusercontent.com/ppezzull/glm-claude-hud/main/glm-wrapper.ts"
+REPO_URL="https://raw.githubusercontent.com/ppezzull/glm-claude-hud/master/glm-wrapper.ts"
 SCRIPTS_DIR="$HOME/.claude/scripts"
 SETTINGS="$HOME/.claude/settings.json"
 
