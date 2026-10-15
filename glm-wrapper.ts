@@ -155,6 +155,112 @@ function findBun(): string {
   }
 }
 
+// ─── Contribution 1: inter-session seat name next to the project/user segment ───
+// Walks the ancestor chain to the claude TUI process (same match as watchdog.sh),
+// then reads that session's bus seat name from the inter-session state file.
+
+function findClaudePid(): number {
+  let pid = process.pid;
+  for (let hop = 0; hop < 6; hop++) {
+    let row = "";
+    try {
+      row = execSync(`ps -o ppid=,command= -p ${pid}`, { encoding: "utf8", timeout: 1000 });
+    } catch { break; }
+    const m = row.match(/\s*(\d+)\s+(.*)/);
+    if (!m) break;
+    const ppid = Number(m[1]);
+    const cmd = m[2];
+    if (/(^|\/)claude( |$)/.test(cmd) && !/mcp|daemon|helper|bg-|attach|npm|node/.test(cmd)) return pid;
+    if (ppid <= 1) break;
+    pid = ppid;
+  }
+  return 0;
+}
+
+function seatName(): string {
+  const pid = findClaudePid();
+  if (!pid) return "";
+  try {
+    const f = join(homedir(), ".claude/data/inter-session/clients", `${pid}.session`);
+    const st = JSON.parse(readFileSync(f, "utf8"));
+    // Only show the seat when actually connected: the listener process must be
+    // alive (same health check as watchdog.sh) — a stale .session file doesn't count.
+    const lpid = Number(st.listener_pid || 0);
+    if (!st.name || !lpid) return "";
+    try { process.kill(lpid, 0); } catch { return ""; }
+    // Hide watchdog-assigned auto names (seat-<pid>): only show real seats
+    const name = String(st.name);
+    return /^seat-\d+$/.test(name) ? "" : name;
+  } catch { return ""; }
+}
+
+// ─── Contribution 2: context color scale (research-based thresholds) ───
+// claude-hud colors the context with a flat 3-level scale and buffers the shown
+// percent against the autocompact point (raw/(autocompact%)). We recolor bar,
+// percent and transcript size on the Context line using the SHOWN percent so
+// color and number always agree.
+//
+// Thresholds on the shown percent (100% = autocompact fires; with the default
+// 80% autocompact this equals raw/0.8):
+//   green  < 50  → raw < 40%  — safe zone: below the 30–40% band where the
+//                             RULER benchmark sees "effective context" break
+//                             down vs the claimed window
+//   yellow 50–70 → raw 40–56% — watch
+//   orange 70–85 → raw 56–68% — degradation zone ("lost in the middle",
+//                             context rot grows with input length)
+//   red    85–95 → raw 68–76% — approaching/past Claude Code's ~75% compaction
+//                             trigger; quality and cost both degrade
+//   violet ≥ 95  → compaction imminent/overdue — act now (/compact or restart)
+//
+// Research: arxiv.org/abs/2307.03172 (Lost in the Middle), NVIDIA RULER
+// (arxiv.org/abs/2404.06654), Chroma "Context Rot" (trychroma.com/research/context-rot).
+
+const HUD_RESET = "\x1b[0m";
+const CONTEXT_COLORS = {
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  orange: "\x1b[38;5;208m",
+  red: "\x1b[31m",
+  violet: "\x1b[35m",
+} as const;
+
+function contextColor(shownPct: number): string {
+  if (shownPct >= 95) return CONTEXT_COLORS.violet;
+  if (shownPct >= 85) return CONTEXT_COLORS.red;
+  if (shownPct >= 70) return CONTEXT_COLORS.orange;
+  if (shownPct >= 50) return CONTEXT_COLORS.yellow;
+  return CONTEXT_COLORS.green;
+}
+
+/** Post-process claude-hud output: seat name on line 1, context color scale. */
+function postprocess(out: string, stdin: any): string {
+  const lines = out.split("\n");
+
+  // Seat name at the RIGHT END of the counts row, same grey as its items:
+  //   "1 CLAUDE.md | 5 MCPs | 4 hooks | pezbrain"
+  const seat = seatName();
+  if (seat) {
+    const countsIdx = lines.findIndex((l) => l.includes("CLAUDE.md") && l.includes("MCPs"));
+    if (countsIdx >= 0 && !lines[countsIdx].includes(seat)) {
+      lines[countsIdx] += `\x1b[2m | ${seat}\x1b[0m`;
+    }
+  }
+
+  // Context color scale: recolor bar + percent + transcript size on the Context line
+  const ci = lines.findIndex((l) => l.includes("Context") && l.includes("%"));
+  if (ci >= 0) {
+    const pm = lines[ci].match(/\x1b\[(?:31|32|33)m(\d{1,3})%/);
+    if (pm) {
+      const c = contextColor(Number(pm[1]));
+      lines[ci] = lines[ci]
+        .replace(/\x1b\[(?:31|32|33)m(█+)/, `${c}$1`)
+        .replace(/\x1b\[(?:31|32|33)m(\d{1,3}%)/, `${c}$1`)
+        .replace(/\x1b\[2m( · [\d.]+[KMGT]?B)/, `${c}$1`);
+    }
+  }
+  return lines.join("\n");
+}
+
 (async () => {
   const raw = (await readStdin()).trim();
   if (!raw) return;
@@ -253,7 +359,7 @@ function findBun(): string {
   child.stdout.on("data", (c: Buffer) => { output += c.toString(); });
   child.stdout.on("end", () => {
     clearTimeout(timeout);
-    if (output) process.stdout.write(output);
+    if (output) process.stdout.write(postprocess(output, stdin));
   });
   child.on("error", () => { clearTimeout(timeout); });
 })();
