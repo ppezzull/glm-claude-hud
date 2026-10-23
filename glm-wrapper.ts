@@ -177,17 +177,34 @@ function findClaudePid(): number {
   return 0;
 }
 
+function seatState(pid: number): { name?: string; listener_pid?: number } | null {
+  const dir = join(homedir(), ".claude/data/inter-session/clients");
+  const candidates = [join(dir, `${pid}.session`)];
+  // Linux fleet boxes run persistent seats with INTER_SESSION_PPID_OVERRIDE
+  // (state keyed to ppid 1, not the claude pid) — fall back to any live state.
+  try {
+    for (const e of readdirSync(dir)) {
+      if (e.endsWith(".session")) candidates.push(join(dir, e));
+    }
+  } catch { /* dir missing */ }
+  for (const f of candidates) {
+    try {
+      const st = JSON.parse(readFileSync(f, "utf8"));
+      const lpid = Number(st.listener_pid || 0);
+      if (st.name && lpid) {
+        try { process.kill(lpid, 0); return st; } catch { /* stale */ }
+      }
+    } catch { /* unreadable */ }
+  }
+  return null;
+}
+
 function seatName(): string {
   const pid = findClaudePid();
   if (!pid) return "";
   try {
-    const f = join(homedir(), ".claude/data/inter-session/clients", `${pid}.session`);
-    const st = JSON.parse(readFileSync(f, "utf8"));
-    // Only show the seat when actually connected: the listener process must be
-    // alive (same health check as watchdog.sh) — a stale .session file doesn't count.
-    const lpid = Number(st.listener_pid || 0);
-    if (!st.name || !lpid) return "";
-    try { process.kill(lpid, 0); } catch { return ""; }
+    const st = seatState(pid);
+    if (!st) return "";
     // Hide watchdog-assigned auto names (seat-<pid>): only show real seats
     const name = String(st.name);
     return /^seat-\d+$/.test(name) ? "" : name;
