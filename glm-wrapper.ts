@@ -28,7 +28,7 @@
  * ~/.cache/zhipu-hud-debug.log.
  */
 
-import { readFileSync, readdirSync, existsSync, mkdirSync, statSync, appendFileSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, statSync, appendFileSync, openSync, readSync, closeSync } from "node:fs";
 import { spawn, execSync, execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
@@ -153,6 +153,57 @@ function findBun(): string {
   } catch {
     return "bun";
   }
+}
+
+// ─── Contribution 3 (from nebula fleet wrapper, 2026-10-09): context_window synthesis ───
+// On proxied model ids (GLM via Z.AI) Claude Code cannot size the context window,
+// so it omits stdin.context_window and claude-hud renders no Context line at all.
+// These two helpers synthesize it from the session transcript.
+
+/** Context window for the current model: env override > "[1m]" suffix > 200k. */
+function contextWindowFor(modelId: string): number {
+  const fromEnv = Number(process.env.GLM_HUD_CONTEXT_WINDOW);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  if (/\[1m\]/i.test(modelId)) return 1_000_000;
+  return 200_000;
+}
+
+/**
+ * Last usage block from the session transcript, or null. Reads only the tail
+ * of the file (256k) so large sessions stay cheap; malformed lines are skipped.
+ */
+function lastTranscriptUsage(
+  transcriptPath: unknown
+): { input: number; output: number; cacheCreation: number; cacheRead: number } | null {
+  if (typeof transcriptPath !== "string" || !existsSync(transcriptPath)) return null;
+  try {
+    const TAIL = 256 * 1024;
+    const size = statSync(transcriptPath).size;
+    const start = Math.max(0, size - TAIL);
+    const buf = Buffer.alloc(size - start);
+    const fd = openSync(transcriptPath, "r");
+    try {
+      readSync(fd, buf, 0, buf.length, start);
+    } finally {
+      closeSync(fd);
+    }
+    const lines = buf.toString("utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line.includes("\"usage\"")) continue;
+      let entry: any;
+      try { entry = JSON.parse(line); } catch { continue; }
+      const u = entry?.message?.usage ?? entry?.usage;
+      if (!u) continue;
+      const input = u.input_tokens ?? 0;
+      const output = u.output_tokens ?? 0;
+      const cacheCreation = u.cache_creation_input_tokens ?? 0;
+      const cacheRead = u.cache_read_input_tokens ?? 0;
+      if (input + output + cacheCreation + cacheRead === 0) continue;
+      return { input, output, cacheCreation, cacheRead };
+    }
+  } catch {}
+  return null;
 }
 
 // ─── Contribution 1: inter-session seat name next to the project/user segment ───
@@ -338,6 +389,35 @@ function postprocess(out: string, stdin: any): string {
         used_percentage: weekly.percentage,
         resets_at: Math.floor(weekly.nextResetTime / 1000),
       };
+    }
+  }
+
+  // Synthesize context_window when Claude Code omits it (proxied model ids like
+  // glm-5.3): fill level from the transcript's last usage block, window size from
+  // the "[1m]" model suffix or GLM_HUD_CONTEXT_WINDOW (default 200k). Without
+  // this the Context line (and the new color scale) never renders on GLM setups.
+  if (!stdin.context_window || !(stdin.context_window.context_window_size > 0)) {
+    const usage = lastTranscriptUsage(stdin.transcript_path);
+    const win = contextWindowFor(
+      [stdin.model?.id, stdin.model?.display_name].filter(Boolean).join(" ")
+    );
+    if (usage) {
+      const used = usage.input + usage.output + usage.cacheCreation + usage.cacheRead;
+      if (used > 0) {
+        const pct = Math.round((used / win) * 100);
+        stdin.context_window = {
+          context_window_size: win,
+          used_percentage: pct,
+          remaining_percentage: Math.max(0, 100 - pct),
+          current_usage: {
+            input_tokens: usage.input,
+            output_tokens: usage.output,
+            cache_creation_input_tokens: usage.cacheCreation,
+            cache_read_input_tokens: usage.cacheRead,
+          },
+          total_input_tokens: used,
+        };
+      }
     }
   }
 
